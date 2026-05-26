@@ -1,0 +1,103 @@
+-- ============================================================
+-- Funnel Leakage Analysis by Lead Cohort Month
+-- Grain: 1 row per cohort month (month contact first became a Lead)
+-- Audience: Internal Marketing Team
+-- Tables: hubspot_via_dwio.Contact, hubspot_via_dwio.ContactLifecycleStageHistory
+-- ============================================================
+
+WITH contact_funnel AS (
+  SELECT
+    c.VId,
+    c.community_partner,
+    c.hs_analytics_source,
+
+    -- Cohort anchor: when they first became a Lead
+    DATE(clsh.hs_v2_date_entered_Lead) as lead_date,
+    DATE_TRUNC(DATE(clsh.hs_v2_date_entered_Lead), MONTH) as cohort_month,
+
+    -- Subsequent stage entry dates
+    DATE(clsh.hs_v2_date_entered_Marketing_Qualified_Lead) as mql_date,
+    DATE(clsh.hs_v2_date_entered_Sales_Qualified_Lead)     as sql_date,
+    DATE(clsh.hs_v2_date_entered_Opportunity)              as opportunity_date,
+    DATE(clsh.hs_v2_date_entered_Client)                   as client_date
+
+  FROM `uat-environment-357715.hubspot_via_dwio.Contact` c
+  LEFT JOIN `uat-environment-357715.hubspot_via_dwio.ContactLifecycleStageHistory` clsh
+    ON c.VId = clsh.VId
+  WHERE c.investor_record = 'true'
+    AND clsh.hs_v2_date_entered_Lead IS NOT NULL
+),
+
+cohort_funnel AS (
+  SELECT
+    cohort_month,
+
+    -- Volume at each stage (contacts who reached that stage from this cohort)
+    COUNT(DISTINCT VId)                                                        AS leads,
+    COUNT(DISTINCT CASE WHEN mql_date >= lead_date        THEN VId END)        AS mqls,
+    COUNT(DISTINCT CASE WHEN sql_date >= lead_date        THEN VId END)        AS sqls,
+    COUNT(DISTINCT CASE WHEN opportunity_date >= lead_date THEN VId END)       AS opportunities,
+    COUNT(DISTINCT CASE WHEN client_date >= lead_date     THEN VId END)        AS clients,
+
+    -- Days to convert (avg for those who converted)
+    ROUND(AVG(CASE WHEN mql_date >= lead_date
+              THEN DATE_DIFF(mql_date, lead_date, DAY) END), 1)                AS avg_days_lead_to_mql,
+    ROUND(AVG(CASE WHEN sql_date >= mql_date AND mql_date >= lead_date
+              THEN DATE_DIFF(sql_date, mql_date, DAY) END), 1)                 AS avg_days_mql_to_sql,
+    ROUND(AVG(CASE WHEN opportunity_date >= sql_date AND sql_date >= lead_date
+              THEN DATE_DIFF(opportunity_date, sql_date, DAY) END), 1)         AS avg_days_sql_to_opportunity,
+    ROUND(AVG(CASE WHEN client_date >= opportunity_date AND opportunity_date >= lead_date
+              THEN DATE_DIFF(client_date, opportunity_date, DAY) END), 1)      AS avg_days_opportunity_to_client
+
+  FROM contact_funnel
+  WHERE cohort_month IS NOT NULL
+  GROUP BY cohort_month
+)
+
+SELECT
+  cohort_month,
+  FORMAT_DATE('%Y-%m', cohort_month)                                           AS cohort_year_month,
+  EXTRACT(YEAR FROM cohort_month)                                              AS cohort_year,
+  EXTRACT(MONTH FROM cohort_month)                                             AS cohort_month_num,
+  FORMAT_DATE('%Y-Q%Q', cohort_month)                                          AS cohort_quarter,
+
+  -- Raw counts
+  leads,
+  mqls,
+  sqls,
+  opportunities,
+  clients,
+
+  -- Drop-off counts at each stage
+  leads - mqls                                                                  AS dropped_at_lead,
+  mqls  - sqls                                                                  AS dropped_at_mql,
+  sqls  - opportunities                                                         AS dropped_at_sql,
+  opportunities - clients                                                       AS dropped_at_opportunity,
+
+  -- Conversion rates (stage to stage)
+  ROUND(SAFE_DIVIDE(mqls, leads) * 100, 2)                                     AS lead_to_mql_rate,
+  ROUND(SAFE_DIVIDE(sqls, mqls) * 100, 2)                                      AS mql_to_sql_rate,
+  ROUND(SAFE_DIVIDE(opportunities, sqls) * 100, 2)                             AS sql_to_opportunity_rate,
+  ROUND(SAFE_DIVIDE(clients, opportunities) * 100, 2)                          AS opportunity_to_client_rate,
+
+  -- Overall funnel conversion (lead all the way to client)
+  ROUND(SAFE_DIVIDE(clients, leads) * 100, 2)                                  AS lead_to_client_rate,
+
+  -- Time-to-convert metrics
+  avg_days_lead_to_mql,
+  avg_days_mql_to_sql,
+  avg_days_sql_to_opportunity,
+  avg_days_opportunity_to_client,
+
+  -- Total avg sales cycle for converted clients
+  ROUND(
+    COALESCE(avg_days_lead_to_mql, 0) +
+    COALESCE(avg_days_mql_to_sql, 0) +
+    COALESCE(avg_days_sql_to_opportunity, 0) +
+    COALESCE(avg_days_opportunity_to_client, 0), 1
+  )                                                                             AS avg_total_days_lead_to_client,
+
+  CURRENT_TIMESTAMP()                                                           AS last_updated
+
+FROM cohort_funnel
+ORDER BY cohort_month DESC
