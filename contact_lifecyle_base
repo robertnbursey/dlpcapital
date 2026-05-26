@@ -1,0 +1,194 @@
+-- ============================================================
+-- BASE TABLE: contact_lifecycle_base
+-- Grain: 1 row per contact
+-- Purpose: Single source of truth for all contact-level lifecycle,
+--          source attribution, and funnel progression data.
+--          Replaces: Leads, Marketing Qualified Leads, Conversion Data,
+--          Organic Search (Lead/MQL/Conversion Rate/Revenue),
+--          CP - Leads, Affiliate Partner (Lead/MQL/Conversion Rate)
+-- Sources: hubspot_via_dwio.Contact
+--          hubspot_via_dwio.ContactLifecycleStageHistory
+-- Refresh: Daily
+-- ============================================================
+
+CREATE OR REPLACE TABLE `uat-environment-357715.marketing.contact_lifecycle_base` AS
+
+SELECT
+
+  -- --------------------------------------------------------
+  -- Contact identifiers
+  -- --------------------------------------------------------
+  c.VId,
+  c.firstname,
+  c.lastname,
+  c.email,
+
+  -- --------------------------------------------------------
+  -- Contact attributes
+  -- --------------------------------------------------------
+  c.investor_record,
+  c.lifecyclestage                              AS current_lifecycle_stage,
+  c.hs_analytics_source,
+  c.leadsource,
+  c.record_source__for_use_                    AS record_source,
+  c.record_source_detail_1__for_use_           AS record_source_detail_1,
+  c.record_source_detail_2__for_use_           AS record_source_detail_2,
+  c.community_partner,
+  SAFE_CAST(c.uniqueappfoliocontactid AS INT64) AS appfolio_contact_id,
+
+  -- --------------------------------------------------------
+  -- Source classification flags (used across many queries)
+  -- --------------------------------------------------------
+  CASE
+    WHEN c.hs_analytics_source = 'ORGANIC_SEARCH'                          THEN 'Organic Search'
+    WHEN UPPER(c.record_source_detail_1__for_use_) LIKE '%AFFILIATE%'      THEN 'Affiliate Partner'
+    WHEN c.community_partner IS NOT NULL
+     AND c.community_partner NOT IN ('NOT a Community Partner','Unknown','') THEN 'Community Partner'
+    WHEN c.leadsource IN ('Hosted Event/Webinar','Trade Show/Conferences',
+                          'Trade Shows/Conference')                         THEN 'Events'
+    WHEN c.leadsource IN ('Web Form','web','Google Natural Search',
+                          'Bing Natural Search','Chatbot')                  THEN 'Web/Organic'
+    WHEN c.leadsource IN ('Employee Referral','Client/Prospect/External Referral',
+                          'Inner Circle Referral')                          THEN 'Employee/Client Referral'
+    WHEN c.leadsource IN ('Paid Referral','Advertising - Digital',
+                          'Radio/Podcast','radio')                          THEN 'Paid/Advertising'
+    WHEN c.leadsource = 'Inbound Call'                                      THEN 'Inbound Call'
+    WHEN c.record_source__for_use_ = 'Forms'                               THEN 'Web/Organic'
+    WHEN c.record_source__for_use_ IN ('Live Event','Webinar')             THEN 'Events'
+    WHEN c.record_source__for_use_ IN ('Sales Extension','Meetings',
+                                        'BCC''d Email')                     THEN 'Sales Outreach'
+    ELSE 'Unattributed'
+  END                                           AS source_category,
+
+  -- Is this an affiliate partner contact (no community partner)?
+  CASE
+    WHEN UPPER(c.record_source_detail_1__for_use_) LIKE '%AFFILIATE%'
+     AND (c.community_partner IS NULL
+          OR c.community_partner IN ('NOT a Community Partner','Unknown',''))
+    THEN TRUE ELSE FALSE
+  END                                           AS is_affiliate_partner,
+
+  -- Is this a community partner contact?
+  CASE
+    WHEN c.community_partner IS NOT NULL
+     AND c.community_partner NOT IN ('NOT a Community Partner','Unknown','')
+    THEN TRUE ELSE FALSE
+  END                                           AS is_community_partner,
+
+  -- --------------------------------------------------------
+  -- Contact creation / lead entry dates
+  -- --------------------------------------------------------
+  DATE(c.createdate)                            AS contact_created_date,
+  DATE_TRUNC(DATE(c.createdate), MONTH)         AS contact_created_month,
+  EXTRACT(YEAR FROM DATE(c.createdate))         AS contact_created_year,
+  FORMAT_DATE('%Y-Q%Q', DATE(c.createdate))     AS contact_created_quarter,
+
+  -- --------------------------------------------------------
+  -- Lifecycle stage entry dates (from ContactLifecycleStageHistory)
+  -- --------------------------------------------------------
+  DATE(clsh.hs_v2_date_entered_Lead)                          AS date_entered_lead,
+  DATE_TRUNC(DATE(clsh.hs_v2_date_entered_Lead), MONTH)       AS lead_month,
+
+  DATE(clsh.hs_v2_date_entered_Marketing_Qualified_Lead)      AS date_entered_mql,
+  DATE_TRUNC(DATE(clsh.hs_v2_date_entered_Marketing_Qualified_Lead), MONTH) AS mql_month,
+
+  DATE(clsh.hs_v2_date_entered_Sales_Qualified_Lead)          AS date_entered_sql,
+  DATE_TRUNC(DATE(clsh.hs_v2_date_entered_Sales_Qualified_Lead), MONTH)     AS sql_month,
+
+  DATE(clsh.hs_v2_date_entered_Opportunity)                   AS date_entered_opportunity,
+  DATE_TRUNC(DATE(clsh.hs_v2_date_entered_Opportunity), MONTH) AS opportunity_month,
+
+  DATE(clsh.hs_v2_date_entered_Client)                        AS date_entered_client,
+  DATE_TRUNC(DATE(clsh.hs_v2_date_entered_Client), MONTH)     AS client_month,
+
+  -- --------------------------------------------------------
+  -- Funnel progression flags (1/0 for easy SUM aggregation)
+  -- --------------------------------------------------------
+  CASE WHEN clsh.hs_v2_date_entered_Lead IS NOT NULL
+       THEN 1 ELSE 0 END                                      AS is_lead,
+
+  CASE WHEN clsh.hs_v2_date_entered_Marketing_Qualified_Lead IS NOT NULL
+       THEN 1 ELSE 0 END                                      AS is_mql,
+
+  -- SQL: explicit SQL stage OR reached Opportunity (inferred qualification)
+  CASE WHEN clsh.hs_v2_date_entered_Sales_Qualified_Lead IS NOT NULL
+            OR clsh.hs_v2_date_entered_Opportunity IS NOT NULL
+       THEN 1 ELSE 0 END                                      AS is_sql,
+
+  CASE WHEN clsh.hs_v2_date_entered_Opportunity IS NOT NULL
+       THEN 1 ELSE 0 END                                      AS is_opportunity,
+
+  CASE WHEN clsh.hs_v2_date_entered_Client IS NOT NULL
+       THEN 1 ELSE 0 END                                      AS is_client,
+
+  -- --------------------------------------------------------
+  -- Sequential progression flags
+  -- (only counts conversion if it happened AFTER the prior stage)
+  -- --------------------------------------------------------
+  CASE
+    WHEN clsh.hs_v2_date_entered_Marketing_Qualified_Lead IS NOT NULL
+     AND clsh.hs_v2_date_entered_Lead IS NOT NULL
+     AND clsh.hs_v2_date_entered_Marketing_Qualified_Lead >= clsh.hs_v2_date_entered_Lead
+    THEN 1 ELSE 0
+  END                                                         AS lead_converted_to_mql,
+
+  CASE
+    WHEN clsh.hs_v2_date_entered_Sales_Qualified_Lead IS NOT NULL
+     AND clsh.hs_v2_date_entered_Marketing_Qualified_Lead IS NOT NULL
+     AND clsh.hs_v2_date_entered_Sales_Qualified_Lead >= clsh.hs_v2_date_entered_Marketing_Qualified_Lead
+    THEN 1 ELSE 0
+  END                                                         AS mql_converted_to_sql,
+
+  CASE
+    WHEN clsh.hs_v2_date_entered_Opportunity IS NOT NULL
+     AND clsh.hs_v2_date_entered_Sales_Qualified_Lead IS NOT NULL
+     AND clsh.hs_v2_date_entered_Opportunity >= clsh.hs_v2_date_entered_Sales_Qualified_Lead
+    THEN 1 ELSE 0
+  END                                                         AS sql_converted_to_opportunity,
+
+  CASE
+    WHEN clsh.hs_v2_date_entered_Client IS NOT NULL
+     AND clsh.hs_v2_date_entered_Opportunity IS NOT NULL
+     AND clsh.hs_v2_date_entered_Client >= clsh.hs_v2_date_entered_Opportunity
+    THEN 1 ELSE 0
+  END                                                         AS opportunity_converted_to_client,
+
+  -- --------------------------------------------------------
+  -- Days between stages (for velocity/cycle time analysis)
+  -- --------------------------------------------------------
+  DATE_DIFF(
+    DATE(clsh.hs_v2_date_entered_Marketing_Qualified_Lead),
+    DATE(clsh.hs_v2_date_entered_Lead),
+    DAY
+  )                                                           AS days_lead_to_mql,
+
+  DATE_DIFF(
+    DATE(clsh.hs_v2_date_entered_Sales_Qualified_Lead),
+    DATE(clsh.hs_v2_date_entered_Marketing_Qualified_Lead),
+    DAY
+  )                                                           AS days_mql_to_sql,
+
+  DATE_DIFF(
+    DATE(clsh.hs_v2_date_entered_Opportunity),
+    DATE(clsh.hs_v2_date_entered_Sales_Qualified_Lead),
+    DAY
+  )                                                           AS days_sql_to_opportunity,
+
+  DATE_DIFF(
+    DATE(clsh.hs_v2_date_entered_Client),
+    DATE(clsh.hs_v2_date_entered_Opportunity),
+    DAY
+  )                                                           AS days_opportunity_to_client,
+
+  -- --------------------------------------------------------
+  -- Metadata
+  -- --------------------------------------------------------
+  c.lastmodifieddate                            AS contact_last_modified,
+  CURRENT_TIMESTAMP()                           AS last_updated
+
+FROM `uat-environment-357715.hubspot_via_dwio.Contact` c
+LEFT JOIN `uat-environment-357715.hubspot_via_dwio.ContactLifecycleStageHistory` clsh
+  ON c.VId = clsh.VId
+
+-- Include all contacts — no date filter here so dashboards can apply their own windows
+WHERE c.createdate IS NOT NULL
