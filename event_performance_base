@@ -1,0 +1,440 @@
+-- ============================================================
+-- BASE TABLE: event_performance_base
+-- Grain: 1 row per event
+-- Purpose: Single source of truth for all marketing event
+--          performance data across both Zoom (webinars) and
+--          Accelevents (in-person/hybrid events). Combines event
+--          metadata, actual attendance with lifecycle breakdown,
+--          estimated attendance where data is sparse (Accelevents
+--          dinner events only), and 14-day deal attribution.
+--          Replaces: MarketingEventParticipations (Accelevents),
+--          WebinarParticipations (Zoom)
+-- Sources: hubspot_via_dwio.MarketingEvent
+--          marketing.MarketingEventParticipations
+--          hubspot_via_dwio.Contact
+--          hubspot_via_dwio.Deal
+--          hubspot_via_dwio.DealContactAssociations
+-- Grain: 1 row per event
+-- Refresh: Daily
+-- ============================================================
+
+CREATE OR REPLACE TABLE `uat-environment-357715.marketing.event_performance_base` AS
+
+WITH latest_participation AS (
+  -- Deduplicate participation records — keep most recent per contact per event
+  SELECT
+    marketing_event_id,
+    contact_id,
+    attendance_state,
+    attendance_percentage,
+    ROW_NUMBER() OVER (
+      PARTITION BY marketing_event_id, contact_id
+      ORDER BY occurred_at DESC
+    ) AS rn
+  FROM `uat-environment-357715.marketing.MarketingEventParticipations`
+),
+
+event_attendance AS (
+  -- Actual attendance counts with lifecycle breakdown per event
+  -- Covers both Zoom and Accelevents
+  SELECT
+    me.MarketingEventId,
+    me.AppInfo_Name                                           AS platform,
+    me.EventName,
+    me.EventOrganizer,
+    me.EventDescription,
+    me.StartDateTime,
+    me.EndDateTime,
+    me.Registrants,
+
+    -- Event type classification
+    -- Zoom uses webinar/training/demo/meeting taxonomy
+    -- Accelevents uses dinner/conference/mastermind taxonomy
+    CASE
+      WHEN me.AppInfo_Name = 'Zoom' THEN
+        CASE
+          WHEN LOWER(me.EventName) LIKE '%webinar%'    THEN 'Webinar'
+          WHEN LOWER(me.EventName) LIKE '%training%'   THEN 'Training'
+          WHEN LOWER(me.EventName) LIKE '%demo%'       THEN 'Demo'
+          WHEN LOWER(me.EventName) LIKE '%conference%' THEN 'Conference'
+          WHEN LOWER(me.EventName) LIKE '%meeting%'    THEN 'Meeting'
+          ELSE 'Other'
+        END
+      ELSE
+        CASE
+          WHEN LOWER(me.EventName) LIKE '%dinner%'                                        THEN 'Dinner'
+          WHEN LOWER(me.EventName) LIKE '%family%'
+            OR LOWER(me.EventName) LIKE '%conference%'                                    THEN 'Conference'
+          WHEN LOWER(me.EventName) LIKE '%mastermind%'
+            OR LOWER(me.EventName) LIKE '%luncheon%'                                      THEN 'Mastermind'
+          ELSE 'Other'
+        END
+    END                                                       AS event_type,
+
+    -- Size category
+    -- Accelevents dinners use different thresholds than standard events
+    CASE
+      WHEN me.AppInfo_Name = 'Zoom' THEN
+        CASE
+          WHEN me.Registrants <= 50  THEN 'Small'
+          WHEN me.Registrants <= 200 THEN 'Medium'
+          ELSE 'Large'
+        END
+      WHEN LOWER(me.EventName) LIKE '%dinner%' THEN
+        CASE
+          WHEN me.Registrants <= 150 THEN 'Small_Dinner'
+          WHEN me.Registrants <= 400 THEN 'Medium_Dinner'
+          ELSE 'Large_Dinner'
+        END
+      ELSE
+        CASE
+          WHEN me.Registrants <= 50  THEN 'Small'
+          WHEN me.Registrants <= 200 THEN 'Medium'
+          ELSE 'Large'
+        END
+    END                                                       AS size_category,
+
+    -- Family event multiplier (Accelevents only — affects attendance estimates)
+    CASE
+      WHEN LOWER(me.EventName) LIKE '%family%' THEN 1.6
+      ELSE 1.0
+    END                                                       AS family_multiplier,
+
+    -- Actual attendance counts
+    COUNT(DISTINCT CASE WHEN lp.attendance_state = 'ATTENDED'
+                        THEN lp.contact_id END)               AS actual_attendees,
+
+    -- Lifecycle breakdown of attendees
+    COUNT(DISTINCT CASE WHEN c.lifecyclestage = 'subscriber'
+                         AND lp.attendance_state = 'ATTENDED'
+                        THEN lp.contact_id END)               AS actual_subscribers,
+    COUNT(DISTINCT CASE WHEN c.lifecyclestage = 'lead'
+                         AND lp.attendance_state = 'ATTENDED'
+                        THEN lp.contact_id END)               AS actual_leads,
+    COUNT(DISTINCT CASE WHEN c.lifecyclestage = 'marketingqualifiedlead'
+                         AND lp.attendance_state = 'ATTENDED'
+                        THEN lp.contact_id END)               AS actual_mqls,
+    COUNT(DISTINCT CASE WHEN c.lifecyclestage = 'salesqualifiedlead'
+                         AND lp.attendance_state = 'ATTENDED'
+                        THEN lp.contact_id END)               AS actual_sqls,
+    COUNT(DISTINCT CASE WHEN c.lifecyclestage = 'opportunity'
+                         AND lp.attendance_state = 'ATTENDED'
+                        THEN lp.contact_id END)               AS actual_opportunities,
+    COUNT(DISTINCT CASE WHEN c.lifecyclestage = 'customer'
+                         AND lp.attendance_state = 'ATTENDED'
+                        THEN lp.contact_id END)               AS actual_customers,
+    COUNT(DISTINCT CASE WHEN c.lifecyclestage = 'other'
+                         AND lp.attendance_state = 'ATTENDED'
+                        THEN lp.contact_id END)               AS actual_other
+
+  FROM `uat-environment-357715.hubspot_via_dwio.MarketingEvent` me
+  LEFT JOIN latest_participation lp
+    ON CAST(me.MarketingEventId AS STRING) = lp.marketing_event_id
+    AND lp.rn = 1
+  LEFT JOIN `uat-environment-357715.hubspot_via_dwio.Contact` c
+    ON lp.contact_id = CAST(c.vid AS STRING)
+  WHERE me.AppInfo_Name IN ('Zoom', 'Accelevents')
+    AND LOWER(me.EventName) NOT LIKE '%test%'
+    AND DATETIME(me.EndDateTime) < DATETIME(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 DAY))
+  GROUP BY
+    me.MarketingEventId, me.AppInfo_Name, me.EventName, me.EventOrganizer,
+    me.EventDescription, me.StartDateTime, me.EndDateTime, me.Registrants
+),
+
+accelevents_with_data AS (
+  -- Subset of Accelevents with actual attendance data
+  -- Used to build benchmarks for estimating sparse dinner events
+  SELECT
+    MarketingEventId,
+    EventOrganizer,
+    event_type,
+    size_category,
+    actual_attendees,
+    Registrants,
+    SAFE_DIVIDE(actual_attendees, Registrants)                AS attendance_rate,
+    CASE
+      WHEN DATE_DIFF(CURRENT_DATE(), DATE(EndDateTime), DAY) <= 90  THEN 3.0
+      WHEN DATE_DIFF(CURRENT_DATE(), DATE(EndDateTime), DAY) <= 180 THEN 2.0
+      ELSE 1.0
+    END                                                       AS recency_weight
+  FROM event_attendance
+  WHERE platform = 'Accelevents'
+    AND actual_attendees > 0
+),
+
+accelevents_benchmarks AS (
+  -- Weighted attendance rate benchmarks by organizer + event type + size
+  -- Used only for Accelevents dinner events with < 15 actual attendees
+  SELECT
+    EventOrganizer,
+    event_type,
+    size_category,
+    1                                                         AS priority_level,
+    CASE
+      WHEN COUNT(*) >= 4 THEN 'High'
+      WHEN COUNT(*) >= 2 THEN 'Medium'
+      ELSE 'Low'
+    END                                                       AS confidence_level,
+    CASE
+      WHEN event_type = 'Dinner' AND size_category = 'Small_Dinner' THEN
+        GREATEST((SUM(attendance_rate * recency_weight) / SUM(recency_weight)) * 1.8, 0.78)
+      WHEN event_type = 'Dinner' AND size_category = 'Medium_Dinner' THEN
+        GREATEST((SUM(attendance_rate * recency_weight) / SUM(recency_weight)) * 1.6, 0.72)
+      WHEN event_type = 'Dinner' THEN
+        GREATEST((SUM(attendance_rate * recency_weight) / SUM(recency_weight)) * 1.4, 0.68)
+      WHEN event_type = 'Conference' THEN
+        (SUM(attendance_rate * recency_weight) / SUM(recency_weight)) * 1.4
+      ELSE
+        (SUM(attendance_rate * recency_weight) / SUM(recency_weight)) * 1.2
+    END                                                       AS avg_rate,
+    COUNT(*)                                                  AS sample_size
+  FROM accelevents_with_data
+  GROUP BY EventOrganizer, event_type, size_category
+  HAVING COUNT(*) >= 2
+
+  UNION ALL SELECT 'ALL_ORGS','Dinner','Small_Dinner',  2,'Medium',0.78,1
+  UNION ALL SELECT 'ALL_ORGS','Dinner','Medium_Dinner', 2,'Medium',0.72,1
+  UNION ALL SELECT 'ALL_ORGS','Dinner','ALL_SIZES',     3,'Medium',0.78,1
+  UNION ALL SELECT 'ALL_ORGS','Conference','ALL_SIZES', 3,'Medium',0.65,1
+  UNION ALL SELECT 'ALL_ORGS','ALL_TYPES','ALL_SIZES',  4,'Low',   0.60,1
+),
+
+event_with_best_benchmark AS (
+  -- Match each Accelevents event to its best benchmark (lowest priority_level wins)
+  SELECT
+    ea.*,
+    ab.avg_rate                                               AS benchmark_rate,
+    ab.confidence_level,
+    ROW_NUMBER() OVER (
+      PARTITION BY ea.MarketingEventId
+      ORDER BY ab.priority_level ASC
+    )                                                         AS match_rank
+  FROM event_attendance ea
+  LEFT JOIN accelevents_benchmarks ab ON (
+       (ab.EventOrganizer = ea.EventOrganizer AND ab.event_type = ea.event_type AND ab.size_category = ea.size_category)
+    OR (ab.EventOrganizer = 'ALL_ORGS'        AND ab.event_type = ea.event_type AND ab.size_category = ea.size_category)
+    OR (ab.EventOrganizer = 'ALL_ORGS'        AND ab.event_type = ea.event_type AND ab.size_category = 'ALL_SIZES')
+    OR (ab.EventOrganizer = 'ALL_ORGS'        AND ab.event_type = 'ALL_TYPES'   AND ab.size_category = 'ALL_SIZES')
+  )
+  WHERE ea.platform = 'Accelevents'
+    AND ab.avg_rate IS NOT NULL
+),
+
+deal_attribution AS (
+  -- Deals created within 14 days of event end date by attendees
+  -- Covers both Zoom and Accelevents
+  SELECT
+    CAST(me.MarketingEventId AS STRING)                       AS marketing_event_id,
+    COUNT(DISTINCT d.DealId)                                  AS deals_created_count,
+    COALESCE(SUM(d.amount), 0)                                AS deals_created_total_amount
+  FROM `uat-environment-357715.hubspot_via_dwio.MarketingEvent` me
+  INNER JOIN latest_participation lp
+    ON CAST(me.MarketingEventId AS STRING) = lp.marketing_event_id
+    AND lp.rn = 1
+    AND lp.attendance_state = 'ATTENDED'
+  INNER JOIN `uat-environment-357715.hubspot_via_dwio.DealContactAssociations` dca
+    ON CAST(lp.contact_id AS INT64) = dca.VId
+  INNER JOIN `uat-environment-357715.hubspot_via_dwio.Deal` d
+    ON dca.DealId = d.DealId
+  WHERE me.AppInfo_Name IN ('Zoom', 'Accelevents')
+    AND LOWER(me.EventName) NOT LIKE '%test%'
+    AND d.pipeline = '54488983'
+    AND DATE(d.createdate) BETWEEN DATE(me.EndDateTime)
+        AND DATE_ADD(DATE(me.EndDateTime), INTERVAL 14 DAY)
+    AND d.amount IS NOT NULL
+    AND d.amount > 0
+  GROUP BY me.MarketingEventId
+)
+
+SELECT
+  -- --------------------------------------------------------
+  -- Event identifiers and metadata
+  -- --------------------------------------------------------
+  ea.MarketingEventId                                         AS event_id,
+  ea.platform,
+  ea.EventName                                                AS event_name,
+  ea.EventOrganizer                                           AS organizer,
+  ea.EventDescription                                         AS description,
+  ea.event_type,
+  ea.size_category,
+  ea.family_multiplier,
+
+  -- --------------------------------------------------------
+  -- Event dates and time dimensions
+  -- --------------------------------------------------------
+  DATE(ea.StartDateTime)                                      AS event_date,
+  ea.StartDateTime                                            AS event_start_timestamp,
+  ea.EndDateTime                                              AS event_end_timestamp,
+  DATE_TRUNC(DATE(ea.StartDateTime), MONTH)                   AS event_month,
+  DATE_TRUNC(DATE(ea.StartDateTime), QUARTER)                 AS event_quarter,
+  EXTRACT(YEAR FROM DATE(ea.StartDateTime))                   AS event_year,
+  FORMAT_DATE('%Y-%m', DATE(ea.StartDateTime))                AS event_year_month,
+  FORMAT_DATE('%Y-Q%Q', DATE(ea.StartDateTime))               AS event_year_quarter,
+  DATE_DIFF(CURRENT_DATE(), DATE(ea.EndDateTime), DAY)        AS days_since_event,
+
+  -- --------------------------------------------------------
+  -- Registrants
+  -- --------------------------------------------------------
+  ea.Registrants                                              AS total_registrants,
+
+  -- --------------------------------------------------------
+  -- Raw actual attendance
+  -- --------------------------------------------------------
+  ea.actual_attendees,
+  ea.actual_subscribers,
+  ea.actual_leads,
+  ea.actual_mqls,
+  ea.actual_sqls,
+  ea.actual_opportunities,
+  ea.actual_customers,
+  ea.actual_other,
+  ROUND(SAFE_DIVIDE(ea.actual_attendees, ea.Registrants), 3)  AS actual_attendance_rate,
+
+  -- --------------------------------------------------------
+  -- Final attendance
+  -- Zoom: always uses actual data
+  -- Accelevents: uses estimates for dinners with < 15 attendees
+  --              or any event with 0 attendees
+  -- --------------------------------------------------------
+  CASE
+    WHEN ea.platform = 'Zoom' THEN
+      ea.actual_attendees
+    WHEN ea.event_type = 'Dinner' AND ea.actual_attendees < 15 THEN
+      ROUND(ea.Registrants * (COALESCE(ewb.benchmark_rate, 0.60) * ea.family_multiplier))
+    WHEN ea.actual_attendees = 0 THEN
+      ROUND(ea.Registrants * (COALESCE(ewb.benchmark_rate, 0.60) * ea.family_multiplier))
+    ELSE
+      ea.actual_attendees
+  END                                                         AS final_attendees,
+
+  CASE
+    WHEN ea.platform = 'Zoom' THEN
+      ROUND(SAFE_DIVIDE(ea.actual_attendees, ea.Registrants), 3)
+    WHEN ea.event_type = 'Dinner' AND ea.actual_attendees < 15 THEN
+      ROUND(COALESCE(ewb.benchmark_rate, 0.60) * ea.family_multiplier, 3)
+    WHEN ea.actual_attendees = 0 THEN
+      ROUND(COALESCE(ewb.benchmark_rate, 0.60) * ea.family_multiplier, 3)
+    ELSE
+      ROUND(SAFE_DIVIDE(ea.actual_attendees, ea.Registrants), 3)
+  END                                                         AS final_attendance_rate,
+
+  -- --------------------------------------------------------
+  -- Estimated lifecycle breakdown
+  -- (only applied when using estimates, otherwise actual values)
+  -- --------------------------------------------------------
+  CASE
+    WHEN ea.platform = 'Zoom'                                               THEN ea.actual_subscribers
+    WHEN ea.event_type = 'Dinner' AND ea.actual_attendees < 15              THEN 0
+    WHEN ea.actual_attendees = 0                                            THEN 0
+    ELSE ea.actual_subscribers
+  END                                                         AS attended_subscribers,
+
+  CASE
+    WHEN ea.platform = 'Zoom'                                               THEN ea.actual_leads
+    WHEN ea.event_type = 'Dinner' AND ea.actual_attendees < 15              THEN 0
+    WHEN ea.actual_attendees = 0                                            THEN 0
+    ELSE ea.actual_leads
+  END                                                         AS attended_leads,
+
+  CASE
+    WHEN ea.platform = 'Zoom'                                               THEN ea.actual_mqls
+    WHEN ea.event_type = 'Dinner' AND ea.actual_attendees < 15
+      THEN ROUND(ea.Registrants * (COALESCE(ewb.benchmark_rate,0.60) * ea.family_multiplier) * 0.50)
+    WHEN ea.actual_attendees = 0
+      THEN ROUND(ea.Registrants * (COALESCE(ewb.benchmark_rate,0.60) * ea.family_multiplier) * 0.50)
+    ELSE ea.actual_mqls
+  END                                                         AS attended_mqls,
+
+  CASE
+    WHEN ea.platform = 'Zoom'                                               THEN ea.actual_sqls
+    WHEN ea.event_type = 'Dinner' AND ea.actual_attendees < 15
+      THEN ROUND(ea.Registrants * (COALESCE(ewb.benchmark_rate,0.60) * ea.family_multiplier) * 0.08)
+    WHEN ea.actual_attendees = 0
+      THEN ROUND(ea.Registrants * (COALESCE(ewb.benchmark_rate,0.60) * ea.family_multiplier) * 0.08)
+    ELSE ea.actual_sqls
+  END                                                         AS attended_sqls,
+
+  CASE
+    WHEN ea.platform = 'Zoom'                                               THEN ea.actual_opportunities
+    WHEN ea.event_type = 'Dinner' AND ea.actual_attendees < 15
+      THEN ROUND(ea.Registrants * (COALESCE(ewb.benchmark_rate,0.60) * ea.family_multiplier) * 0.05)
+    WHEN ea.actual_attendees = 0
+      THEN ROUND(ea.Registrants * (COALESCE(ewb.benchmark_rate,0.60) * ea.family_multiplier) * 0.05)
+    ELSE ea.actual_opportunities
+  END                                                         AS attended_opportunities,
+
+  CASE
+    WHEN ea.platform = 'Zoom'                                               THEN ea.actual_customers
+    WHEN ea.event_type = 'Dinner' AND ea.actual_attendees < 15
+      THEN ROUND(ea.Registrants * (COALESCE(ewb.benchmark_rate,0.60) * ea.family_multiplier) * 0.30)
+    WHEN ea.actual_attendees = 0
+      THEN ROUND(ea.Registrants * (COALESCE(ewb.benchmark_rate,0.60) * ea.family_multiplier) * 0.30)
+    ELSE ea.actual_customers
+  END                                                         AS attended_customers,
+
+  CASE
+    WHEN ea.platform = 'Zoom'                                               THEN ea.actual_other
+    WHEN ea.event_type = 'Dinner' AND ea.actual_attendees < 15              THEN 2
+    WHEN ea.actual_attendees = 0                                            THEN 2
+    ELSE ea.actual_other
+  END                                                         AS attended_other,
+
+  -- --------------------------------------------------------
+  -- Data source / estimation metadata
+  -- --------------------------------------------------------
+  CASE
+    WHEN ea.platform = 'Zoom'                                               THEN 'Actual (HubSpot)'
+    WHEN ea.event_type = 'Dinner' AND ea.actual_attendees < 15
+      THEN CONCAT('Estimated (', COALESCE(ewb.confidence_level, 'Low'), ' confidence)')
+    WHEN ea.actual_attendees = 0
+      THEN CONCAT('Estimated (', COALESCE(ewb.confidence_level, 'Low'), ' confidence)')
+    ELSE 'Actual (HubSpot)'
+  END                                                         AS data_source,
+  ewb.benchmark_rate,
+  ewb.confidence_level                                        AS benchmark_confidence,
+
+  -- --------------------------------------------------------
+  -- 14-day deal attribution
+  -- --------------------------------------------------------
+  CASE
+    WHEN ea.platform = 'Zoom'                                               THEN COALESCE(da.deals_created_count, 0)
+    WHEN ea.event_type = 'Dinner' AND ea.actual_attendees < 15              THEN NULL
+    WHEN ea.actual_attendees = 0                                            THEN NULL
+    ELSE COALESCE(da.deals_created_count, 0)
+  END                                                         AS deals_created_14_days,
+
+  CASE
+    WHEN ea.platform = 'Zoom'                                               THEN COALESCE(da.deals_created_total_amount, 0)
+    WHEN ea.event_type = 'Dinner' AND ea.actual_attendees < 15              THEN NULL
+    WHEN ea.actual_attendees = 0                                            THEN NULL
+    ELSE COALESCE(da.deals_created_total_amount, 0)
+  END                                                         AS deals_created_total_amount,
+
+  -- --------------------------------------------------------
+  -- Deal efficiency metrics
+  -- --------------------------------------------------------
+  CASE
+    WHEN ea.platform = 'Zoom' AND ea.actual_attendees > 0
+      THEN ROUND(SAFE_DIVIDE(COALESCE(da.deals_created_count, 0), ea.actual_attendees), 4)
+    ELSE NULL
+  END                                                         AS deals_per_attendee,
+
+  CASE
+    WHEN ea.platform = 'Zoom' AND ea.actual_attendees > 0
+      THEN ROUND(SAFE_DIVIDE(COALESCE(da.deals_created_total_amount, 0), ea.actual_attendees), 2)
+    ELSE NULL
+  END                                                         AS deal_value_per_attendee,
+
+  -- --------------------------------------------------------
+  -- Metadata
+  -- --------------------------------------------------------
+  CURRENT_TIMESTAMP()                                         AS last_updated
+
+FROM event_attendance ea
+LEFT JOIN event_with_best_benchmark ewb
+  ON ea.MarketingEventId = ewb.MarketingEventId
+  AND ewb.match_rank = 1
+LEFT JOIN deal_attribution da
+  ON CAST(ea.MarketingEventId AS STRING) = da.marketing_event_id
+
+ORDER BY DATE(ea.StartDateTime) DESC
