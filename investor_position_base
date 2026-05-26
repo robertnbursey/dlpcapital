@@ -1,0 +1,352 @@
+-- ============================================================
+-- BASE TABLE: investor_position_base
+-- Grain: 1 row per contact (AppFolio investor)
+-- Purpose: Single source of truth for all investor-level position
+--          data. Combines AppFolio position/contribution/distribution
+--          data with HubSpot contact enrichment (name, email, DOB)
+--          via the hubspot_and_appfolio bridge dataset. Includes
+--          unreturned capital, tenure, age, investor classification
+--          (Retail vs Institutional Client), fund holdings, and
+--          portal engagement. Excludes advisors, internal DLP
+--          contacts, and DLP internal entities.
+--          Replaces: InvestorsByTenure, Investor Tenure Primary,
+--          InvestorsByAgeRange
+-- Sources: appfolio_im.im_contacts
+--          appfolio_im.im_contact_group_memberships
+--          appfolio_im.im_entities
+--          appfolio_im.im_investors_contacts
+--          appfolio_im.im_positions
+--          appfolio_im.im_contributions
+--          appfolio_im.im_distribution_items
+--          appfolio_im.im_distributions
+--          hubspot_and_appfolio.PositionEntityContactRelationships
+--          hubspot_and_appfolio.position_summary
+--          hubspot_via_dwio.Contact
+-- Grain: 1 row per AppFolio contact (investor)
+-- Refresh: Daily
+-- ============================================================
+
+CREATE OR REPLACE TABLE `uat-environment-357715.marketing.investor_position_base` AS
+
+-- --------------------------------------------------------
+-- EXCLUSION LISTS
+-- --------------------------------------------------------
+
+WITH advisor_contacts AS (
+  -- Contacts who ARE advisors:
+  -- have a company name, are in institutional/RIA groups (22, 24),
+  -- or use internal DLP email domains
+  SELECT DISTINCT c.id AS contact_id
+  FROM `uat-environment-357715.appfolio_im.im_contacts` c
+  LEFT JOIN `uat-environment-357715.appfolio_im.im_contact_group_memberships` cgm
+    ON c.id = cgm.member_contact_id
+  WHERE (c.company_name IS NOT NULL AND c.company_name != '')
+     OR cgm.contact_group_id IN (22, 24)
+     OR c.portal_email LIKE '%@dlpcapital.com'
+     OR c.portal_email LIKE '%@dreamliveprosper.com'
+),
+
+internal_contacts AS (
+  -- Contacts explicitly marked as Internal in AppFolio
+  SELECT DISTINCT id AS contact_id
+  FROM `uat-environment-357715.appfolio_im.im_contacts`
+  WHERE contact_type = 'Internal'
+),
+
+institutional_entities AS (
+  -- Entities that have at least one advisor contact
+  -- Used to classify Retail vs Institutional Client investors
+  SELECT DISTINCT ic.entity_id
+  FROM `uat-environment-357715.appfolio_im.im_investors_contacts` ic
+  WHERE ic.contact_id IN (SELECT contact_id FROM advisor_contacts)
+),
+
+dlp_internal_entities AS (
+  -- DLP-owned or internally managed entities — excluded from all investor metrics
+  SELECT DISTINCT e.id AS entity_id
+  FROM `uat-environment-357715.appfolio_im.im_entities` e
+  LEFT JOIN `uat-environment-357715.appfolio_im.im_investors_contacts` ic
+    ON e.id = ic.entity_id
+  LEFT JOIN `uat-environment-357715.appfolio_im.im_contacts` c
+    ON ic.contact_id = c.id
+  WHERE e.name LIKE '%DLP%'
+     OR e.name LIKE '%Dream Live Prosper%'
+     OR c.contact_type = 'Internal'
+),
+
+-- --------------------------------------------------------
+-- POSITION FINANCIALS
+-- --------------------------------------------------------
+
+position_contributions AS (
+  -- Total capital contributed per position
+  SELECT
+    position_id,
+    SUM(amount)                                               AS total_contrib
+  FROM `uat-environment-357715.appfolio_im.im_contributions`
+  GROUP BY position_id
+),
+
+position_roc AS (
+  -- Return of capital (redemptions) per position
+  SELECT
+    di.position_id,
+    SUM(di.amount)                                            AS return_of_capital
+  FROM `uat-environment-357715.appfolio_im.im_distribution_items` di
+  JOIN `uat-environment-357715.appfolio_im.im_distributions` d
+    ON di.distribution_id = d.id
+  WHERE LOWER(d.distribution_type) IN ('redemption','return of capital','return_of_capital')
+  GROUP BY di.position_id
+),
+
+entities_with_unreturned_capital AS (
+  -- Active positions with unreturned capital, excluding DLP internal entities
+  -- Joins fund name for string aggregation downstream
+  SELECT
+    e.id                                                      AS entity_id,
+    e.name                                                    AS entity_name,
+    e.entity_type,
+    e.primary_contact_id,
+    p.id                                                      AS position_id,
+    fund_entity.name                                          AS fund_name,
+    COALESCE(pc.total_contrib, 0)
+      - COALESCE(roc.return_of_capital, 0)                   AS unreturned_capital
+  FROM `uat-environment-357715.appfolio_im.im_positions` p
+  JOIN `uat-environment-357715.appfolio_im.im_entities` e
+    ON p.holding_entity_id = e.id
+  LEFT JOIN `uat-environment-357715.appfolio_im.im_entities` fund_entity
+    ON p.owned_entity_id = fund_entity.id
+  LEFT JOIN position_contributions pc
+    ON p.id = pc.position_id
+  LEFT JOIN position_roc roc
+    ON p.id = roc.position_id
+  WHERE p.is_exited = 0
+    AND e.primary_contact_id IS NOT NULL
+    AND e.id NOT IN (SELECT entity_id FROM dlp_internal_entities)
+),
+
+-- --------------------------------------------------------
+-- INVESTOR CLASSIFICATION
+-- Retail: primary contact on non-institutional entities
+-- Institutional Client: signer contact on advisor-managed entities
+-- --------------------------------------------------------
+
+retail_investors AS (
+  SELECT
+    euc.primary_contact_id                                    AS contact_id,
+    'Retail'                                                  AS investor_type,
+    euc.entity_id,
+    euc.entity_name,
+    euc.entity_type,
+    euc.position_id,
+    euc.fund_name,
+    euc.unreturned_capital
+  FROM entities_with_unreturned_capital euc
+  WHERE euc.entity_id NOT IN (SELECT entity_id FROM institutional_entities)
+    AND euc.primary_contact_id NOT IN (SELECT contact_id FROM advisor_contacts)
+),
+
+institutional_clients AS (
+  SELECT
+    ic.contact_id,
+    'Institutional Client'                                    AS investor_type,
+    euc.entity_id,
+    euc.entity_name,
+    euc.entity_type,
+    euc.position_id,
+    euc.fund_name,
+    euc.unreturned_capital
+  FROM entities_with_unreturned_capital euc
+  JOIN `uat-environment-357715.appfolio_im.im_investors_contacts` ic
+    ON euc.entity_id = ic.entity_id
+  WHERE euc.entity_id IN (SELECT entity_id FROM institutional_entities)
+    AND ic.contact_id NOT IN (SELECT contact_id FROM advisor_contacts)
+    AND ic.is_signer = 1
+),
+
+all_investors AS (
+  SELECT * FROM retail_investors
+  UNION ALL
+  SELECT * FROM institutional_clients
+),
+
+-- --------------------------------------------------------
+-- CONTACT-LEVEL AGGREGATES
+-- --------------------------------------------------------
+
+contact_summary AS (
+  -- Roll position/entity data up to contact level
+  SELECT
+    contact_id,
+    investor_type,
+    COUNT(DISTINCT entity_id)                                 AS entity_count,
+    COUNT(DISTINCT position_id)                               AS position_count,
+    STRING_AGG(DISTINCT fund_name, ', ' ORDER BY fund_name)  AS funds_invested,
+    SUM(unreturned_capital)                                   AS total_unreturned_capital
+  FROM all_investors
+  GROUP BY contact_id, investor_type
+  HAVING SUM(unreturned_capital) > 0
+),
+
+contact_positions AS (
+  SELECT DISTINCT contact_id, position_id
+  FROM all_investors
+),
+
+first_contrib AS (
+  -- Earliest contribution date per contact across all their positions
+  SELECT
+    cp.contact_id,
+    MIN(COALESCE(ic.effective_date, ic.received_date))        AS first_contribution_date
+  FROM contact_positions cp
+  JOIN `uat-environment-357715.appfolio_im.im_contributions` ic
+    ON ic.position_id = cp.position_id
+  GROUP BY cp.contact_id
+),
+
+-- --------------------------------------------------------
+-- HUBSPOT ENRICHMENT
+-- Join HubSpot contact data via uniqueappfoliocontactid
+-- Deduplicated to one HubSpot row per AppFolio contact
+-- using most recently modified record
+-- --------------------------------------------------------
+
+hubspot_contact_map AS (
+  SELECT
+    SAFE_CAST(TRIM(uniqueappfoliocontactid) AS INT64)         AS appfolio_contact_id,
+    VId                                                       AS hubspot_vid,
+    firstname,
+    lastname,
+    email,
+    COALESCE(
+      DATE(birthday),
+      SAFE.PARSE_DATE('%Y-%m-%d', date_of_birth)
+    )                                                         AS date_of_birth,
+    ROW_NUMBER() OVER (
+      PARTITION BY SAFE_CAST(TRIM(uniqueappfoliocontactid) AS INT64)
+      ORDER BY lastmodifieddate DESC, VId DESC
+    )                                                         AS rn
+  FROM `uat-environment-357715.hubspot_via_dwio.Contact`
+  WHERE uniqueappfoliocontactid IS NOT NULL
+),
+
+-- --------------------------------------------------------
+-- ALTERNATIVE UNRETURNED CAPITAL via hubspot_and_appfolio bridge
+-- Used for age range query which uses the pre-built bridge tables
+-- Falls back to AppFolio raw calculation where bridge is unavailable
+-- --------------------------------------------------------
+
+bridge_unreturned AS (
+  SELECT
+    rel.contact_id,
+    SUM(COALESCE(ps.unreturned_capital, rel.unreturned_capital, 0)) AS entity_unret
+  FROM `uat-environment-357715.hubspot_and_appfolio.PositionEntityContactRelationships` rel
+  JOIN `uat-environment-357715.hubspot_and_appfolio.position_summary` ps
+    ON ps.position_id = rel.position_id
+  GROUP BY rel.contact_id, rel.entity_id
+  HAVING SUM(COALESCE(ps.unreturned_capital, rel.unreturned_capital, 0)) > 0
+)
+
+-- --------------------------------------------------------
+-- FINAL OUTPUT
+-- --------------------------------------------------------
+
+SELECT
+
+  -- AppFolio contact identifiers
+  cs.contact_id                                               AS appfolio_contact_id,
+  hcm.hubspot_vid,
+
+  -- Contact details (from AppFolio)
+  c.first_name,
+  c.last_name,
+  c.portal_email,
+  c.company_name,
+  c.contact_type,
+  c.portal_activated_at,
+  c.last_login_at,
+
+  -- HubSpot enrichment
+  hcm.firstname                                               AS hs_firstname,
+  hcm.lastname                                                AS hs_lastname,
+  hcm.email                                                   AS hs_email,
+  hcm.date_of_birth,
+
+  -- Investor classification
+  cs.investor_type,
+
+  -- Investment summary
+  cs.entity_count,
+  cs.position_count,
+  cs.funds_invested,
+  cs.total_unreturned_capital,
+
+  -- Tenure
+  fc.first_contribution_date,
+  DATE_DIFF(CURRENT_DATE(), fc.first_contribution_date, YEAR) AS years_invested,
+
+  CASE
+    WHEN DATE_DIFF(CURRENT_DATE(), fc.first_contribution_date, YEAR) IS NULL THEN 'Unknown'
+    WHEN DATE_DIFF(CURRENT_DATE(), fc.first_contribution_date, YEAR) < 3    THEN '<3 years'
+    WHEN DATE_DIFF(CURRENT_DATE(), fc.first_contribution_date, YEAR) < 5    THEN '3–5 years'
+    WHEN DATE_DIFF(CURRENT_DATE(), fc.first_contribution_date, YEAR) < 10   THEN '5–10 years'
+    ELSE '10+ years'
+  END                                                         AS tenure_bucket,
+
+  CASE
+    WHEN DATE_DIFF(CURRENT_DATE(), fc.first_contribution_date, YEAR) IS NULL THEN 5
+    WHEN DATE_DIFF(CURRENT_DATE(), fc.first_contribution_date, YEAR) < 3    THEN 1
+    WHEN DATE_DIFF(CURRENT_DATE(), fc.first_contribution_date, YEAR) < 5    THEN 2
+    WHEN DATE_DIFF(CURRENT_DATE(), fc.first_contribution_date, YEAR) < 10   THEN 3
+    ELSE 4
+  END                                                         AS tenure_bucket_sort,
+
+  -- Age (from HubSpot DOB)
+  DATE_DIFF(CURRENT_DATE(), hcm.date_of_birth, YEAR)          AS age,
+
+  CASE
+    WHEN hcm.date_of_birth IS NULL                                            THEN 'Unknown'
+    WHEN DATE_DIFF(CURRENT_DATE(), hcm.date_of_birth, YEAR) < 18             THEN '<18'
+    WHEN DATE_DIFF(CURRENT_DATE(), hcm.date_of_birth, YEAR) <= 24            THEN '18–24'
+    WHEN DATE_DIFF(CURRENT_DATE(), hcm.date_of_birth, YEAR) <= 34            THEN '25–34'
+    WHEN DATE_DIFF(CURRENT_DATE(), hcm.date_of_birth, YEAR) <= 44            THEN '35–44'
+    WHEN DATE_DIFF(CURRENT_DATE(), hcm.date_of_birth, YEAR) <= 54            THEN '45–54'
+    WHEN DATE_DIFF(CURRENT_DATE(), hcm.date_of_birth, YEAR) <= 64            THEN '55–64'
+    ELSE '65+'
+  END                                                         AS age_bucket,
+
+  CASE
+    WHEN hcm.date_of_birth IS NULL                                            THEN 99
+    WHEN DATE_DIFF(CURRENT_DATE(), hcm.date_of_birth, YEAR) < 18             THEN 0
+    WHEN DATE_DIFF(CURRENT_DATE(), hcm.date_of_birth, YEAR) <= 24            THEN 1
+    WHEN DATE_DIFF(CURRENT_DATE(), hcm.date_of_birth, YEAR) <= 34            THEN 2
+    WHEN DATE_DIFF(CURRENT_DATE(), hcm.date_of_birth, YEAR) <= 44            THEN 3
+    WHEN DATE_DIFF(CURRENT_DATE(), hcm.date_of_birth, YEAR) <= 54            THEN 4
+    WHEN DATE_DIFF(CURRENT_DATE(), hcm.date_of_birth, YEAR) <= 64            THEN 5
+    ELSE 6
+  END                                                         AS age_bucket_sort,
+
+  -- Has DOB flag (for filtering age-based charts)
+  CASE WHEN hcm.date_of_birth IS NOT NULL THEN TRUE ELSE FALSE END AS has_dob,
+
+  -- Convenience aggregation column (for COUNT in Looker Studio)
+  1                                                           AS investors,
+
+  -- Metadata
+  CURRENT_TIMESTAMP()                                         AS last_updated
+
+FROM contact_summary cs
+JOIN `uat-environment-357715.appfolio_im.im_contacts` c
+  ON cs.contact_id = c.id
+LEFT JOIN first_contrib fc
+  ON cs.contact_id = fc.contact_id
+LEFT JOIN hubspot_contact_map hcm
+  ON hcm.appfolio_contact_id = cs.contact_id
+  AND hcm.rn = 1
+
+WHERE c.first_name IS NOT NULL
+  AND c.last_name IS NOT NULL
+  AND c.first_name != ''
+  AND c.last_name != ''
+
+ORDER BY cs.total_unreturned_capital DESC
