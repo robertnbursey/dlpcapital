@@ -1,0 +1,322 @@
+-- ============================================================
+-- BASE TABLE: contact_deal_base
+-- Grain: 1 row per contact
+-- Purpose: Extends contact_lifecycle_base with deal-level metrics,
+--          revenue attribution, event participation, UTM tracking,
+--          referral flags, and Impact affiliate data. Serves as the
+--          single source of truth for any analysis that combines
+--          contact attributes with closed deal outcomes.
+--          Replaces: Organic Search - Conversion and Revenue,
+--          Deal Source Data, Investor type total - new/return,
+--          Affiliate Detail, Lead Source Data - 2025
+-- Sources: hubspot_via_dwio.Contact
+--          hubspot_via_dwio.ContactLifecycleStageHistory
+--          hubspot_via_dwio.Deal
+--          hubspot_via_dwio.DealContactAssociations
+--          hubspot_via_dwio.ContactContactAssociations
+--          hubspot_via_dwio.MarketingEvent
+--          marketing.MarketingEventParticipations
+--          impact.action_locking
+-- Grain: 1 row per contact
+-- Refresh: Daily
+-- ============================================================
+
+CREATE OR REPLACE TABLE `uat-environment-357715.marketing.contact_deal_base` AS
+
+WITH referral_contacts AS (
+  -- Contacts who were referred by someone (used for deal source attribution)
+  SELECT
+    AssociatedVId,
+    COUNT(DISTINCT SourceVId) AS num_referrers
+  FROM `uat-environment-357715.hubspot_via_dwio.ContactContactAssociations`
+  WHERE LabelContactContact = 'Referrer'
+  GROUP BY AssociatedVId
+  HAVING COUNT(DISTINCT SourceVId) < 5
+),
+
+impact_contacts AS (
+  -- Contacts tracked via Impact affiliate platform
+  SELECT
+    SAFE_CAST(customer_id AS INT64) AS contact_vid,
+    MIN(media_partner_name)          AS impact_partner_name,
+    MIN(media_partner_id)            AS impact_partner_id,
+    MIN(campaign_name)               AS impact_campaign_name,
+    MIN(client_cost)                 AS impact_lead_cost,
+    MIN(DATE(event_date))            AS impact_lead_date
+  FROM `uat-environment-357715.impact.action_locking`
+  WHERE _fivetran_deleted = false
+    AND action_tracker_name = 'Lead Submission'
+  GROUP BY customer_id
+),
+
+event_participants AS (
+  -- Contacts who attended a webinar or live event (Zoom or Accelevents)
+  -- Used to override source attribution and prevent double-counting
+  SELECT DISTINCT
+    CAST(mep.contact_id AS INT64)    AS VId,
+    MIN(me.EventName)                AS first_event_name,
+    MIN(me.AppInfo_Name)             AS first_event_platform,
+    MIN(DATE(me.StartDateTime))      AS first_event_date
+  FROM `uat-environment-357715.marketing.MarketingEventParticipations` mep
+  INNER JOIN `uat-environment-357715.hubspot_via_dwio.MarketingEvent` me
+    ON CAST(me.MarketingEventId AS STRING) = mep.marketing_event_id
+  WHERE me.AppInfo_Name IN ('Zoom', 'Accelevents')
+  GROUP BY mep.contact_id
+),
+
+contact_deals AS (
+  -- All deals per contact — both open and closed
+  SELECT
+    dca.VId,
+
+    -- Deal counts
+    COUNT(DISTINCT d.DealId)                                                   AS total_deals,
+    COUNT(DISTINCT CASE WHEN d.dealstage IN ('109693624','127229995')
+                        THEN d.DealId END)                                     AS closed_won_deals,
+    COUNT(DISTINCT CASE WHEN d.hs_is_closed_won = true
+                        THEN d.DealId END)                                     AS hs_closed_won_deals,
+
+    -- Revenue
+    COALESCE(SUM(CASE WHEN d.dealstage IN ('109693624','127229995')
+                      THEN COALESCE(d.hs_closed_amount, d.amount) END), 0)     AS total_closed_won_revenue,
+
+    -- Deal type breakdown (closed won only)
+    COUNT(DISTINCT CASE WHEN d.dealstage IN ('109693624','127229995')
+                         AND d.dealtype = 'New (First Time Investor)'
+                        THEN d.DealId END)                                     AS new_investor_deals,
+    COUNT(DISTINCT CASE WHEN d.dealstage IN ('109693624','127229995')
+                         AND d.dealtype != 'New (First Time Investor)'
+                        THEN d.DealId END)                                     AS returning_investor_deals,
+
+    -- Deal dates
+    MIN(CASE WHEN d.dealstage IN ('109693624','127229995')
+             THEN DATE(d.closedate) END)                                       AS first_deal_close_date,
+    MAX(CASE WHEN d.dealstage IN ('109693624','127229995')
+             THEN DATE(d.closedate) END)                                       AS latest_deal_close_date,
+    DATE_TRUNC(
+      MIN(CASE WHEN d.dealstage IN ('109693624','127229995')
+               THEN DATE(d.closedate) END), MONTH)                             AS first_deal_close_month,
+
+    -- RIA referral flag (deal-level)
+    MAX(CASE WHEN d.is_this_an_ria_referral_ = 'true' THEN 1 ELSE 0 END)      AS has_ria_referral_deal,
+    MAX(CASE WHEN d.is_this_deal_from_a_referral_ = 'true'
+             THEN 1 ELSE 0 END)                                                AS has_referral_deal
+
+  FROM `uat-environment-357715.hubspot_via_dwio.DealContactAssociations` dca
+  INNER JOIN `uat-environment-357715.hubspot_via_dwio.Deal` d
+    ON dca.DealId = d.DealId
+  WHERE d.pipeline = '54488983'
+    AND d.amount IS NOT NULL
+    AND d.amount > 0
+  GROUP BY dca.VId
+)
+
+SELECT
+
+  -- --------------------------------------------------------
+  -- Contact identifiers
+  -- --------------------------------------------------------
+  c.VId,
+  c.firstname,
+  c.lastname,
+  c.email,
+  c.investor_record,
+  c.lifecyclestage                              AS current_lifecycle_stage,
+  SAFE_CAST(c.uniqueappfoliocontactid AS INT64) AS appfolio_contact_id,
+  c.hubspot_owner_id                            AS owner_id,
+
+  -- --------------------------------------------------------
+  -- Contact creation dates
+  -- --------------------------------------------------------
+  DATE(c.createdate)                            AS contact_created_date,
+  DATE_TRUNC(DATE(c.createdate), MONTH)         AS contact_created_month,
+  DATE_TRUNC(DATE(c.createdate), QUARTER)       AS contact_created_quarter,
+  EXTRACT(YEAR FROM DATE(c.createdate))         AS contact_created_year,
+  FORMAT_DATE('%Y-Q%Q', DATE(c.createdate))     AS contact_created_quarter_label,
+
+  -- --------------------------------------------------------
+  -- Source fields (raw)
+  -- --------------------------------------------------------
+  c.hs_analytics_source,
+  c.hs_analytics_source_data_1,
+  c.hs_analytics_source_data_2,
+  c.record_source__for_use_                     AS record_source_raw,
+  c.record_source_detail_1__for_use_            AS record_source_detail_1_raw,
+  c.record_source_detail_2__for_use_            AS record_source_detail_2_raw,
+  c.record_source_detail_3_for_use              AS record_source_detail_3_raw,
+  c.record_source_detail_4__for_use_            AS record_source_detail_4_raw,
+  c.leadsource,
+  c.community_partner,
+
+  -- --------------------------------------------------------
+  -- UTM tracking
+  -- --------------------------------------------------------
+  c.utm_source,
+  c.utm_medium,
+  c.utm_campaign,
+  c.utm_content,
+
+  -- --------------------------------------------------------
+  -- Event participation
+  -- --------------------------------------------------------
+  CASE WHEN ep.VId IS NOT NULL THEN 1 ELSE 0 END AS is_event_participant,
+  ep.first_event_name,
+  ep.first_event_platform,
+  ep.first_event_date,
+
+  -- --------------------------------------------------------
+  -- Primary source classification
+  -- (event participation overrides all other source signals
+  --  to prevent double-counting)
+  -- --------------------------------------------------------
+  CASE
+    -- Level 1: Event participants override everything
+    WHEN ep.VId IS NOT NULL                                                   THEN 'Events/Webinars'
+    -- Level 2: Event-related record_source
+    WHEN LOWER(c.record_source__for_use_) LIKE '%event%'
+      OR LOWER(c.record_source__for_use_) LIKE '%webinar%'                   THEN 'Events/Webinars'
+    -- Level 3: Institutional / RIA
+    WHEN cd.has_ria_referral_deal = 1                                         THEN 'Institutional/RIA'
+    -- Level 4: Community Partner
+    WHEN c.community_partner IS NOT NULL
+     AND c.community_partner NOT IN ('NOT a Community Partner','Unknown','')  THEN 'Community Partner'
+    -- Level 5: Paid / Affiliate (Impact tracked)
+    WHEN ic.contact_vid IS NOT NULL                                           THEN 'Paid/Affiliate'
+    -- Level 6: Referral
+    WHEN cd.has_referral_deal = 1
+      OR rc.AssociatedVId IS NOT NULL                                         THEN 'Referral'
+    -- Level 7: Refine OFFLINE using record_source
+    WHEN c.hs_analytics_source = 'OFFLINE' THEN
+      CASE
+        WHEN LOWER(c.record_source__for_use_) LIKE '%form%'                  THEN 'Web Forms'
+        WHEN LOWER(c.record_source__for_use_) LIKE '%meeting%'               THEN 'Sales Meetings'
+        WHEN LOWER(c.record_source__for_use_) LIKE '%import%'                THEN 'Manual Import'
+        WHEN LOWER(c.record_source__for_use_) LIKE '%crm%'                   THEN 'CRM Integration'
+        WHEN LOWER(c.record_source__for_use_) LIKE '%integration%'           THEN 'Integration'
+        ELSE 'Offline/Direct'
+      END
+    -- Level 8: Standard source buckets
+    WHEN c.leadsource IN ('Hosted Event/Webinar','Trade Show/Conferences',
+                          'Trade Shows/Conference')                           THEN 'Events'
+    WHEN c.leadsource IN ('Web Form','web','Google Natural Search',
+                          'Bing Natural Search','Chatbot')                    THEN 'Web/Organic'
+    WHEN c.hs_analytics_source = 'ORGANIC_SEARCH'                            THEN 'Organic Search'
+    WHEN c.leadsource IN ('Employee Referral',
+                          'Client/Prospect/External Referral',
+                          'Inner Circle Referral')                            THEN 'Employee/Client Referral'
+    WHEN c.leadsource IN ('Paid Referral','Advertising - Digital',
+                          'Radio/Podcast','radio')                            THEN 'Paid/Advertising'
+    WHEN c.leadsource = 'Inbound Call'                                        THEN 'Inbound Call'
+    WHEN c.record_source__for_use_ IN ('Live Event','Webinar')               THEN 'Events'
+    WHEN c.record_source__for_use_ IN ('Sales Extension','Meetings',
+                                        'BCC''d Email')                       THEN 'Sales Outreach'
+    ELSE 'Unattributed/Migration'
+  END                                           AS source_category,
+
+  -- Adjusted record source detail (event name overrides when participant)
+  CASE
+    WHEN ep.VId IS NOT NULL                     THEN ep.first_event_platform
+    WHEN c.hs_analytics_source = 'OFFLINE'      THEN c.record_source__for_use_
+    ELSE c.record_source_detail_1__for_use_
+  END                                           AS record_source_detail_1,
+
+  CASE
+    WHEN ep.VId IS NOT NULL                     THEN ep.first_event_name
+    WHEN c.hs_analytics_source = 'OFFLINE'      THEN c.record_source_detail_1__for_use_
+    ELSE c.record_source_detail_2__for_use_
+  END                                           AS record_source_detail_2,
+
+  -- --------------------------------------------------------
+  -- Impact affiliate data
+  -- --------------------------------------------------------
+  CASE WHEN ic.contact_vid IS NOT NULL THEN 1 ELSE 0 END AS is_impact_affiliate,
+  ic.impact_partner_name,
+  ic.impact_partner_id,
+  ic.impact_campaign_name,
+  ic.impact_lead_cost,
+  ic.impact_lead_date,
+
+  -- --------------------------------------------------------
+  -- Referral flags
+  -- --------------------------------------------------------
+  CASE WHEN rc.AssociatedVId IS NOT NULL THEN 1 ELSE 0 END AS has_contact_referrer,
+  COALESCE(rc.num_referrers, 0)                             AS num_referrers,
+  COALESCE(cd.has_ria_referral_deal, 0)                     AS has_ria_referral_deal,
+  COALESCE(cd.has_referral_deal, 0)                         AS has_referral_deal,
+
+  -- --------------------------------------------------------
+  -- Lifecycle stage entry dates
+  -- --------------------------------------------------------
+  DATE(clsh.hs_v2_date_entered_Lead)                        AS date_entered_lead,
+  DATE_TRUNC(DATE(clsh.hs_v2_date_entered_Lead), MONTH)     AS lead_month,
+  DATE(clsh.hs_v2_date_entered_Marketing_Qualified_Lead)    AS date_entered_mql,
+  DATE(clsh.hs_v2_date_entered_Sales_Qualified_Lead)        AS date_entered_sql,
+  DATE(clsh.hs_v2_date_entered_Opportunity)                 AS date_entered_opportunity,
+  DATE(clsh.hs_v2_date_entered_Client)                      AS date_entered_client,
+
+  -- --------------------------------------------------------
+  -- Funnel progression flags
+  -- --------------------------------------------------------
+  CASE WHEN clsh.hs_v2_date_entered_Marketing_Qualified_Lead IS NOT NULL
+       THEN 1 ELSE 0 END                                    AS became_mql,
+  CASE WHEN clsh.hs_v2_date_entered_Sales_Qualified_Lead IS NOT NULL
+            OR clsh.hs_v2_date_entered_Opportunity IS NOT NULL
+       THEN 1 ELSE 0 END                                    AS became_sql,
+  CASE WHEN clsh.hs_v2_date_entered_Opportunity IS NOT NULL
+       THEN 1 ELSE 0 END                                    AS became_opportunity,
+  CASE WHEN clsh.hs_v2_date_entered_Client IS NOT NULL
+       THEN 1 ELSE 0 END                                    AS became_client,
+
+  -- --------------------------------------------------------
+  -- Deal metrics
+  -- --------------------------------------------------------
+  COALESCE(cd.total_deals, 0)                               AS total_deals,
+  COALESCE(cd.closed_won_deals, 0)                          AS closed_won_deals,
+  COALESCE(cd.total_closed_won_revenue, 0)                  AS total_closed_won_revenue,
+  COALESCE(cd.new_investor_deals, 0)                        AS new_investor_deals,
+  COALESCE(cd.returning_investor_deals, 0)                  AS returning_investor_deals,
+  CASE WHEN COALESCE(cd.new_investor_deals, 0) > 0
+       THEN 'New Investor'
+       ELSE 'Returning Investor'
+  END                                                       AS investor_type,
+  CASE WHEN COALESCE(cd.closed_won_deals, 0) > 0
+       THEN 1 ELSE 0 END                                    AS has_closed_won_deal,
+  cd.first_deal_close_date,
+  cd.latest_deal_close_date,
+  cd.first_deal_close_month,
+
+  -- --------------------------------------------------------
+  -- Days to conversion (from contact creation)
+  -- --------------------------------------------------------
+  DATE_DIFF(
+    DATE(clsh.hs_v2_date_entered_Marketing_Qualified_Lead),
+    DATE(c.createdate), DAY)                                AS days_to_mql,
+  DATE_DIFF(
+    DATE(clsh.hs_v2_date_entered_Sales_Qualified_Lead),
+    DATE(c.createdate), DAY)                                AS days_to_sql,
+  DATE_DIFF(
+    DATE(clsh.hs_v2_date_entered_Opportunity),
+    DATE(c.createdate), DAY)                                AS days_to_opportunity,
+  DATE_DIFF(
+    cd.first_deal_close_date,
+    DATE(c.createdate), DAY)                                AS days_to_first_deal,
+
+  -- --------------------------------------------------------
+  -- Metadata
+  -- --------------------------------------------------------
+  c.lastmodifieddate                            AS contact_last_modified,
+  CURRENT_TIMESTAMP()                           AS last_updated
+
+FROM `uat-environment-357715.hubspot_via_dwio.Contact` c
+LEFT JOIN `uat-environment-357715.hubspot_via_dwio.ContactLifecycleStageHistory` clsh
+  ON c.VId = clsh.VId
+LEFT JOIN contact_deals cd
+  ON c.VId = cd.VId
+LEFT JOIN referral_contacts rc
+  ON c.VId = rc.AssociatedVId
+LEFT JOIN impact_contacts ic
+  ON c.VId = ic.contact_vid
+LEFT JOIN event_participants ep
+  ON c.VId = ep.VId
+
+WHERE c.createdate IS NOT NULL
