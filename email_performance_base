@@ -1,0 +1,208 @@
+-- ============================================================
+-- BASE TABLE: email_performance_base
+-- Grain: 1 row per email campaign
+-- Purpose: Single source of truth for all marketing email
+--          performance data. Combines campaign-level metrics from
+--          MarketingEmail with contact-level engagement events from
+--          CampaignEmailEvent, filtered to active investors.
+--          Pre-calculates performance tiers, indexed trends, and
+--          investor-specific engagement so all email dashboard
+--          views can query a single table.
+--          Replaces: Marketing Email Rates - Investors,
+--          Marketing Email Engagement Trends,
+--          Marketing Email - Monthly Raw Performance,
+--          Marketing Email - Top Campaigns
+-- Sources: hubspot_via_dwio.MarketingEmail
+--          hubspot_via_dwio.CampaignEmailEvent
+--          hubspot_via_dwio.Contact
+-- Grain: 1 row per published email campaign
+-- Refresh: Daily
+-- ============================================================
+
+CREATE OR REPLACE TABLE `uat-environment-357715.marketing.email_performance_base` AS
+
+WITH active_investors AS (
+  -- Contacts with unreturned capital > 0 (current investors)
+  SELECT DISTINCT
+    email,
+    total_unreturned_capital,
+    hs_email_optout
+  FROM `uat-environment-357715.hubspot_via_dwio.Contact`
+  WHERE total_unreturned_capital > 0
+    AND email IS NOT NULL
+),
+
+investor_email_events AS (
+  -- Deduplicated email engagement events for active investors only
+  -- One row per campaign per recipient — MAX() deduplicates multiple events of same type
+  SELECT
+    cee.EmailCampaignId,
+    cee.Recipient,
+    ai.total_unreturned_capital,
+    ai.hs_email_optout,
+    MAX(CASE WHEN cee.Type = 'SENT'
+              THEN 1 ELSE 0 END)                             AS was_sent,
+    MAX(CASE WHEN cee.Type = 'DELIVERED'
+              THEN 1 ELSE 0 END)                             AS was_delivered,
+    MAX(CASE WHEN cee.Type = 'OPEN'
+              THEN 1 ELSE 0 END)                             AS was_opened,
+    MAX(CASE WHEN cee.Type = 'CLICK'
+              THEN 1 ELSE 0 END)                             AS was_clicked,
+    MAX(CASE WHEN cee.Type = 'UNSUBSCRIBE'
+              OR cee.IsUnsubscribe = true
+              THEN 1 ELSE 0 END)                             AS unsubscribed,
+    MAX(CASE WHEN cee.Bounced = true
+              THEN 1 ELSE 0 END)                             AS bounced
+  FROM `uat-environment-357715.hubspot_via_dwio.CampaignEmailEvent` cee
+  JOIN active_investors ai ON cee.Recipient = ai.email
+  GROUP BY cee.EmailCampaignId, cee.Recipient, ai.total_unreturned_capital, ai.hs_email_optout
+),
+
+investor_campaign_stats AS (
+  -- Roll investor engagement up to campaign level
+  SELECT
+    EmailCampaignId,
+    COUNT(DISTINCT Recipient)                                AS investor_recipients,
+    SUM(was_sent)                                            AS investor_sent,
+    SUM(was_delivered)                                       AS investor_delivered,
+    SUM(was_opened)                                          AS investor_opened,
+    SUM(was_clicked)                                         AS investor_clicked,
+    SUM(unsubscribed)                                        AS investor_unsubscribed,
+    SUM(bounced)                                             AS investor_bounced,
+    AVG(total_unreturned_capital)                            AS avg_investor_capital,
+    COUNT(DISTINCT CASE WHEN hs_email_optout = true
+                        THEN Recipient END)                  AS opted_out_investors,
+    SAFE_DIVIDE(SUM(was_delivered), SUM(was_sent)) * 100     AS investor_delivery_rate,
+    SAFE_DIVIDE(SUM(was_opened), SUM(was_delivered)) * 100   AS investor_open_rate,
+    SAFE_DIVIDE(SUM(was_clicked), SUM(was_opened)) * 100     AS investor_click_through_rate,
+    SAFE_DIVIDE(SUM(unsubscribed), SUM(was_sent)) * 100      AS investor_unsub_rate
+  FROM investor_email_events
+  GROUP BY EmailCampaignId
+),
+
+campaign_base AS (
+  -- All published campaigns with core metrics
+  SELECT
+    me.Id                                                    AS campaign_id,
+    me.Name                                                  AS campaign_name,
+    me.Subject                                               AS subject,
+    me.State                                                 AS state,
+    DATE(me.PublishDate)                                     AS send_date,
+    DATE_TRUNC(DATE(me.PublishDate), MONTH)                  AS send_month,
+    DATE_TRUNC(DATE(me.PublishDate), QUARTER)                AS send_quarter,
+    EXTRACT(YEAR FROM DATE(me.PublishDate))                  AS send_year,
+    FORMAT_DATE('%Y-Q%Q', DATE(me.PublishDate))              AS send_quarter_label,
+    FORMAT_DATE('%Y-%m', DATE(me.PublishDate))               AS send_year_month,
+
+    -- Raw campaign counters
+    me.Counters_Sent                                         AS sent,
+    me.Counters_Delivered                                    AS delivered,
+    me.Counters_Open                                         AS opens,
+    me.Counters_Click                                        AS clicks,
+    me.Counters_Unsubscribed                                 AS unsubscribes,
+    me.Counters_Contactslost                                 AS contacts_lost,
+    me.Counters_Unsubscribed + me.Counters_Contactslost      AS list_shrinkage,
+
+    -- HubSpot-calculated ratios
+    me.Ratios_Deliveredratio                                 AS delivery_rate,
+    me.Ratios_Openratio                                      AS open_rate,
+    me.Ratios_Clickratio                                     AS click_rate,
+    me.Ratios_Clickthroughratio                              AS click_through_rate,
+    me.Ratios_Unsubscribedratio                              AS unsub_rate,
+
+    -- Performance tier (based on click rate)
+    CASE
+      WHEN me.Ratios_Clickratio >= 5 THEN 'Excellent (5%+)'
+      WHEN me.Ratios_Clickratio >= 3 THEN 'Good (3-5%)'
+      WHEN me.Ratios_Clickratio >= 1 THEN 'Average (1-3%)'
+      ELSE 'Below Average (<1%)'
+    END                                                      AS performance_tier,
+
+    -- Numeric performance score (for sorting)
+    CASE
+      WHEN me.Ratios_Clickratio >= 5 THEN 5
+      WHEN me.Ratios_Clickratio >= 3 THEN 3
+      WHEN me.Ratios_Clickratio >= 1 THEN 1
+      ELSE 0
+    END                                                      AS performance_score,
+
+    -- High volume flag (used by Top Campaigns query)
+    CASE WHEN me.Counters_Sent > 1000 THEN TRUE ELSE FALSE END AS is_high_volume,
+
+    -- Internal corporate flag
+    CASE WHEN CONTAINS_SUBSTR(me.Name, '[Internal Corporate]')
+         THEN TRUE ELSE FALSE END                            AS is_internal_corporate
+
+  FROM `uat-environment-357715.hubspot_via_dwio.MarketingEmail` me
+  WHERE me.State = 'PUBLISHED'
+    AND me.PublishDate IS NOT NULL
+)
+
+SELECT
+  cb.*,
+
+  -- --------------------------------------------------------
+  -- Indexed trend metrics
+  -- (first month in window = 100, enables trend comparison)
+  -- Calculated across all non-internal campaigns
+  -- --------------------------------------------------------
+  ROUND(
+    SAFE_DIVIDE(cb.sent,
+      FIRST_VALUE(cb.sent) OVER (
+        PARTITION BY cb.is_internal_corporate
+        ORDER BY cb.send_month
+      )
+    ) * 100, 1)                                              AS sent_index,
+
+  ROUND(
+    SAFE_DIVIDE(cb.opens,
+      FIRST_VALUE(cb.opens) OVER (
+        PARTITION BY cb.is_internal_corporate
+        ORDER BY cb.send_month
+      )
+    ) * 100, 1)                                              AS opens_index,
+
+  ROUND(
+    SAFE_DIVIDE(cb.clicks,
+      FIRST_VALUE(cb.clicks) OVER (
+        PARTITION BY cb.is_internal_corporate
+        ORDER BY cb.send_month
+      )
+    ) * 100, 1)                                              AS clicks_index,
+
+  ROUND(
+    SAFE_DIVIDE(cb.unsubscribes,
+      FIRST_VALUE(cb.unsubscribes) OVER (
+        PARTITION BY cb.is_internal_corporate
+        ORDER BY cb.send_month
+      )
+    ) * 100, 1)                                              AS unsubscribes_index,
+
+  -- --------------------------------------------------------
+  -- Investor-specific engagement metrics
+  -- (joined from CampaignEmailEvent x active investors)
+  -- --------------------------------------------------------
+  COALESCE(ics.investor_recipients, 0)                       AS investor_recipients,
+  COALESCE(ics.investor_sent, 0)                             AS investor_sent,
+  COALESCE(ics.investor_delivered, 0)                        AS investor_delivered,
+  COALESCE(ics.investor_opened, 0)                           AS investor_opened,
+  COALESCE(ics.investor_clicked, 0)                          AS investor_clicked,
+  COALESCE(ics.investor_unsubscribed, 0)                     AS investor_unsubscribed,
+  COALESCE(ics.investor_bounced, 0)                          AS investor_bounced,
+  COALESCE(ics.opted_out_investors, 0)                       AS opted_out_investors,
+  ics.avg_investor_capital,
+  ics.investor_delivery_rate,
+  ics.investor_open_rate,
+  ics.investor_click_through_rate,
+  ics.investor_unsub_rate,
+
+  -- --------------------------------------------------------
+  -- Metadata
+  -- --------------------------------------------------------
+  CURRENT_TIMESTAMP()                                        AS last_updated
+
+FROM campaign_base cb
+LEFT JOIN investor_campaign_stats ics
+  ON CAST(cb.campaign_id AS STRING) = CAST(ics.EmailCampaignId AS STRING)
+
+ORDER BY cb.send_date DESC
